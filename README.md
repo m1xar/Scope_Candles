@@ -70,6 +70,8 @@ Two guards matter, and both come from real data:
 - **Space is not a separator.** Cutting on space would turn `Boom 1000 Index`, `Boom 300 Index` and `Boom 50 Index` into one symbol, and would collapse `AUDUSD DFX 10 Index` onto the real `AUDUSD`.
 - **A tail containing digits is not a suffix.** It is part of the instrument name: `BOOM_100` and `BOOM_200` stay distinct, and `Si-9.24` keeps its contract month.
 
+One case the rule cannot get right is share classes: a broker that lists `AGM-A` and `ABR-PD` as separate stock CFDs will see both folded onto their base ticker, because nothing distinguishes a class suffix from a broker suffix. Keep stock groups out of `SYMBOL_INCLUDE_PATH_PREFIXES` unless you need them.
+
 When two raw symbols on the same broker normalize to the same key, the plain form wins (then the shortest, then alphabetical); the rest are skipped and logged once as `symbols.collision`. Both forms are kept in the `symbols` table, so `raw_symbol` always says which broker feed a series came from.
 
 Override the suffix list with `MT5_CANDLES_SYMBOL_SUFFIXES` (comma separated) if a broker needs something else.
