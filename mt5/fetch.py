@@ -9,7 +9,7 @@ from symbols.normalize import SymbolInfo, normalize
 from utils.logging import log_event
 
 from .clock import ServerClock
-from .terminal import MT5Terminal
+from .terminal import IPC_ERROR_CEILING, MT5Terminal
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,14 @@ def copy_rates(
         if rows is not None and len(rows):
             break
         code, description = terminal.mt5.last_error()
-        if code not in (1, 0) and code is not None and code < 0:
+        if code is not None and code <= IPC_ERROR_CEILING:
             raise terminal.failure(f"copy_rates_range failed for {raw_symbol}: {description}", code)
+        if code not in (1, 0) and code is not None and code < 0:
+            log_event(
+                logger, "warning", "candles.copy_rates.failed",
+                symbol=raw_symbol, error=description, error_code=code,
+            )
+            return []
         if attempt < retries:
             time.sleep(_EMPTY_RETRY_SLEEP_SECONDS)
 
