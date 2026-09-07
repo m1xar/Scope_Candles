@@ -21,7 +21,7 @@ DEFAULT_START_DATE = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
 _CLOCK_REFRESH_SECONDS = 6 * 3600.0
 _FAILURE_BACKOFF_SECONDS = 60.0
-_INSERT_BATCH = 200000
+_INSERT_BATCH = 20000
 
 
 def worker_main(worker_id: str, terminal_path: str, connection: Any, **options: Any) -> None:
