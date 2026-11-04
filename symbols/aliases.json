@@ -1,0 +1,151 @@
+{
+  "_comment": "Canonical catalogue symbol -> other names of the SAME cash/spot instrument, already in normalize() form (uppercase, no spaces or specials, broker suffix cut). Never list futures, minis or dated contracts here (NQ, ES, YM, RTY, FDAX, US30M, US500M, USTECH100M, FUTMNQZ23...): a different contract is a different instrument. tests/test_aliases.py enforces the rules. Exact catalogue names (USDRMB/USDCNH, EURRUR/EURRUB, USDRUR/USDRUB are separate MetaQuotes series) always win over an alias.",
+  "aliases": {
+    "DE40": [
+      "GER40",
+      "GER30",
+      "DE30",
+      "DAX",
+      "DAX40",
+      "DAX30",
+      "GERMANY40",
+      "GERMANY30",
+      "DEU40",
+      "GERMAN40"
+    ],
+    "USTEC": [
+      "US100",
+      "USTECH",
+      "USTECH100",
+      "USTEC100",
+      "NAS100",
+      "NAS",
+      "NASDAQ",
+      "NASDAQ100",
+      "NDX",
+      "NDX100",
+      "NDXUSD",
+      "USNDAQ100",
+      "NSDQ"
+    ],
+    "US500": [
+      "SPX500",
+      "SP500",
+      "SPX",
+      "SPXUSD",
+      "USA500",
+      "USSPX500",
+      "US500INDEX",
+      "USSP500"
+    ],
+    "US30": [
+      "DJ30",
+      "DJI30",
+      "DJI",
+      "DOW30",
+      "DOWJONES",
+      "WS30",
+      "USA30",
+      "WALLSTREET30",
+      "USWALLST30"
+    ],
+    "US2000": [
+      "RUSSELL2000",
+      "US2K",
+      "USSC2000"
+    ],
+    "JPN225": [
+      "JP225",
+      "JAP225",
+      "J225",
+      "NIKKEI225",
+      "NIKKEI",
+      "NI225",
+      "JAPAN225"
+    ],
+    "UK100": [
+      "FTSE100",
+      "FTSE",
+      "GB100",
+      "UKX"
+    ],
+    "EUSTX50": [
+      "EU50",
+      "EUR50",
+      "STX50",
+      "ESTX50",
+      "EUSTX",
+      "EURO50",
+      "EUROSTOXX50",
+      "SX5E"
+    ],
+    "FRA40": [
+      "FR40",
+      "CAC",
+      "CAC40",
+      "FRANCE40"
+    ],
+    "ESP35": [
+      "SPA35",
+      "ES35",
+      "IBEX",
+      "IBEX35",
+      "SPAIN35"
+    ],
+    "IT40": [
+      "ITA40",
+      "ITALY40",
+      "FTSEMIB"
+    ],
+    "SWI20": [
+      "CH20",
+      "SMI",
+      "SWISS20",
+      "SUI20"
+    ],
+    "NETH25": [
+      "NL25",
+      "AEX",
+      "NETHERLANDS25"
+    ],
+    "AUS200": [
+      "AU200",
+      "ASX200",
+      "AUSTRALIA200"
+    ],
+    "HK50": [
+      "HSI",
+      "HK33",
+      "HONGKONG50",
+      "HKG33"
+    ],
+    "CHINA50": [
+      "CN50",
+      "CHINAA50",
+      "CHN50",
+      "A50"
+    ],
+    "XAUUSD": [
+      "GOLD",
+      "XAU",
+      "GOLDUSD"
+    ],
+    "XAGUSD": [
+      "SILVER",
+      "XAG",
+      "SILVERUSD"
+    ],
+    "XPTUSD": [
+      "PLATINUM",
+      "XPT"
+    ],
+    "XPDUSD": [
+      "PALLADIUM",
+      "XPD"
+    ],
+    "COPPER": [
+      "XCUUSD",
+      "COPPERUSD"
+    ]
+  }
+}

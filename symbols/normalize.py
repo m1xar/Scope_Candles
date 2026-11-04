@@ -4,7 +4,9 @@ from dataclasses import dataclass
 
 SEPARATORS = frozenset(r'._-#/\+!*^~,:;|()[]{}')
 
-DEFAULT_SUFFIXES = ("micro", "pro", "ecn", "raw", "std", "sc", "cent", "m", "c", "z", "e")
+DEFAULT_SUFFIXES = (
+    "micro", "cash", "Cash", "pro", "ecn", "raw", "std", "sc", "cent", "m", "c", "z", "e", "b",
+)
 
 _MAX_TAIL = 4
 _MIN_LENGTH = 3
@@ -46,13 +48,31 @@ def strip_suffix(raw: str, suffixes: tuple[str, ...] | list[str]) -> str:
     return raw
 
 
+def strip_leading(raw: str) -> str:
+    for index, char in enumerate(raw):
+        if char.isalnum():
+            return raw[index:]
+    return ""
+
+
+def compact(raw: str) -> str:
+    return "".join(char for char in raw if char.isascii() and char.isalnum())
+
+
 def normalize(raw: str, suffixes: tuple[str, ...] | list[str] | None = None) -> str:
-    text = " ".join(raw.split())
+    """The one symbol key used everywhere: catalogue writes, sync state and every lookup.
+
+    Broker decoration is cut first, while case still tells a broker suffix (``m`` in
+    ``XAUUSDm``) from part of the name (``M`` in ``US30M``). Then every space and special
+    character is dropped and the rest is uppercased, so ``Germany 40``, ``germany40`` and
+    ``GERMANY-40`` all give ``GERMANY40``. A slash joins the legs of a pair (``EUR/USD``). An empty suffix list means the defaults.
+    """
+    text = strip_leading(" ".join((raw or "").replace("/", "").split()))
     if not text:
         return ""
     text = strip_separator(text)
-    text = strip_suffix(text, DEFAULT_SUFFIXES if suffixes is None else suffixes)
-    return text.upper()
+    text = strip_suffix(text, suffixes or DEFAULT_SUFFIXES)
+    return compact(text).upper()
 
 
 def _rank(candidate: SymbolInfo) -> tuple[int, int, str]:

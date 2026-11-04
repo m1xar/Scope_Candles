@@ -60,14 +60,20 @@ Brokers decorate the same instrument differently: `XAUUSD`, `XAUUSD.r`, `XAUUSD_
 
 The rule is deliberately small, and it is shaped by what real broker catalogues actually contain:
 
-1. Collapse whitespace.
-2. **Cut at the first separator** (`. _ - # / \ + ! * ^ ~ , : ; | ( ) [ ] { }`) — but only when the tail is at most 4 characters and contains no digit. `EURUSD.pro` -> `EURUSD`, `XAUUSD_i` -> `XAUUSD`, `BTCUSD#` -> `BTCUSD`.
-3. **Strip a glued lowercase suffix** (`micro`, `pro`, `ecn`, `raw`, `std`, `sc`, `cent`, `m`, `c`, `z`, `e`) when the character before it is uppercase or a digit. `AUDCADm` -> `AUDCAD`, `EURAUDmicro` -> `EURAUD`.
-4. Uppercase.
+1. Collapse whitespace, drop `/` (`EUR/USD`) and any leading non-alphanumerics (`.DE40Cash`, `#AAPL`).
+2. **Cut at the first separator** (`. _ - # \ + ! * ^ ~ , : ; | ( ) [ ] { }`) — but only when the tail is at most 4 characters and contains no digit. `EURUSD.pro` -> `EURUSD`, `XAUUSD_i` -> `XAUUSD`, `BTCUSD#` -> `BTCUSD`.
+3. **Strip a glued suffix** (`micro`, `cash`, `Cash`, `pro`, `ecn`, `raw`, `std`, `sc`, `cent`, `m`, `c`, `z`, `e`, `b`) when the character before it is uppercase or a digit. Case matters here: `XAUUSDm` -> `XAUUSD`, but `US30M` (a mini contract) stays `US30M`.
+4. Drop every remaining space and special character, then uppercase. `Germany 40` -> `GERMANY40`, `S&P500` -> `SP500`.
+
+The same function builds the catalogue key when the worker writes and the lookup key when `/candles/{symbol}` or `/price/{symbol}` is called, so a symbol is always found under the key it was stored with. An empty `MT5_CANDLES_SYMBOL_SUFFIXES` means the default list above.
+
+### Aliases
+
+`symbols/aliases.json` maps other names of the same cash/spot instrument onto a catalogue symbol (`GER40`, `DAX40`, `GERMANY40` -> `DE40`; `US100`, `NAS100`, `NDX100` -> `USTEC`; `GOLD` -> `XAUUSD`). Lookup order: the normalized key is a catalogue symbol (`exact`), else it is an alias of one (`alias`), else 404. The response says which (`matched_by`) and echoes `requested`. Futures, minis and dated contracts (`NQ`, `ES`, `FDAX`, `US30M`, `FUTMNQZ23`) are never aliases of cash; `tests/test_aliases.py` enforces that, and that no alias shadows a real catalogue name.
 
 Two guards matter, and both come from real data:
 
-- **Space is not a separator.** Cutting on space would turn `Boom 1000 Index`, `Boom 300 Index` and `Boom 50 Index` into one symbol, and would collapse `AUDUSD DFX 10 Index` onto the real `AUDUSD`.
+- **Space is not a separator.** It is removed, never cut on: cutting would turn `Boom 1000 Index`, `Boom 300 Index` and `Boom 50 Index` into one symbol, and would collapse `AUDUSD DFX 10 Index` onto the real `AUDUSD`.
 - **A tail containing digits is not a suffix.** It is part of the instrument name: `BOOM_100` and `BOOM_200` stay distinct, and `Si-9.24` keeps its contract month.
 
 One case the rule cannot get right is share classes: a broker that lists `AGM-A` and `ABR-PD` as separate stock CFDs will see both folded onto their base ticker, because nothing distinguishes a class suffix from a broker suffix. Keep stock groups out of `SYMBOL_INCLUDE_PATH_PREFIXES` unless you need them.

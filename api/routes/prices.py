@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from api.deps import COMMON_RESPONSES, get_redis, verify_auth, verify_websocket_auth
 from storage.redis_store import decode, price_channel, price_key
-from symbols.normalize import normalize
+from symbols.resolver import canonical
 from utils.config import settings
 from utils.logging import log_event
 
@@ -33,7 +33,7 @@ class Quote(BaseModel):
 
 @router.get("/price/{symbol}", response_model=Quote)
 async def get_price(symbol: str, store: Any = Depends(get_redis)) -> Quote:
-    normalized = normalize(symbol, settings.suffixes)
+    normalized = canonical(symbol, suffixes=settings.suffixes)
     if not normalized:
         raise HTTPException(status_code=404, detail="symbol not found")
     payload = decode(await store.get(price_key(normalized)))
@@ -48,7 +48,7 @@ async def stream_price(websocket: WebSocket, symbol: str) -> None:
         await websocket.close(code=4401, reason="Invalid or missing bearer token")
         return
 
-    normalized = normalize(symbol, settings.suffixes)
+    normalized = canonical(symbol, suffixes=settings.suffixes)
     if not normalized:
         await websocket.close(code=4404, reason="symbol not found")
         return
