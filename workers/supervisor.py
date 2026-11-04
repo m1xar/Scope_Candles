@@ -230,6 +230,9 @@ def build(start_date: datetime) -> Supervisor:
             "chunk_days": settings.backfill_chunk_days,
             "history_retries": settings.symbol_history_retries,
             "prune_cache": settings.prune_cache,
+            "repair_interval_seconds": settings.repair_interval_hours * 3600,
+            "repair_lookback_days": settings.repair_lookback_days,
+            "repair_since": settings.repair_since,
         },
     )
     supervisor.register(

@@ -23,6 +23,15 @@ _CLOCK_REFRESH_SECONDS = 6 * 3600.0
 _FAILURE_BACKOFF_SECONDS = 60.0
 _INSERT_BATCH = 20000
 
+# copy_rates_range answers from the terminal's local history and does not wait for the
+# server to send what is missing. After an outage the local copy holds only the bars the
+# terminal saw since it reconnected, so a catch-up request can come back "successful" but
+# starting days late; taking it at face value moves the watermark past the hole for good.
+_CATCH_UP_LAG = timedelta(hours=2)
+_LATE_FIRST_BAR = timedelta(hours=1)
+_CATCH_UP_WAIT_SECONDS = 2.0
+_IDLE_LOG_EVERY = timedelta(hours=24)
+
 
 def worker_main(worker_id: str, terminal_path: str, connection: Any, **options: Any) -> None:
     configure_logging(options["log_level"], options["log_json"])
@@ -39,6 +48,8 @@ def worker_main(worker_id: str, terminal_path: str, connection: Any, **options: 
     client = None
     clock = ServerClock()
     clock_measured_at = 0.0
+    repair_due_at = 0.0
+    repair_since = _parse_since(options.get("repair_since"))
     try:
         while True:
             started = time.monotonic()
@@ -51,6 +62,11 @@ def worker_main(worker_id: str, terminal_path: str, connection: Any, **options: 
                     clock_measured_at = time.monotonic()
                     log_clock(clock, options["server"])
                 _run_pass(terminal, client, clock, connection, worker_id, options)
+                interval = float(options.get("repair_interval_seconds") or 0)
+                if interval > 0 and time.monotonic() >= repair_due_at:
+                    _run_repair(terminal, client, clock, connection, worker_id, options, repair_since)
+                    repair_since = None
+                    repair_due_at = time.monotonic() + interval
                 if options["prune_cache"]:
                     prune_price_cache(terminal_path)
             except TerminalError as exc:
@@ -165,11 +181,14 @@ def _sync_symbol(
     highest = last
     buffer: list[list[Any]] = []
     retries = options["history_retries"] if last is None else 1
+    catching_up = last is not None and end - start > _CATCH_UP_LAG
     for window_start, window_end in chunks(start, end, options["chunk_days"]):
         candles = copy_rates(
             terminal, info.raw_symbol, window_start, window_end, clock, retries=retries
         )
         retries = 1
+        if catching_up:
+            candles = _settle(terminal, info, window_start, window_end, clock, candles, options)
         if not candles:
             continue
         for moment, open_, high, low, close, tick_volume, real_volume, spread in candles:
@@ -186,7 +205,141 @@ def _sync_symbol(
         written += clickhouse.insert_candles(client, buffer)
     if highest is not None and (last is None or highest > last):
         clickhouse.set_watermark(client, info.symbol, highest, written)
+    if not written and last is not None:
+        _log_idle(terminal, info, last, end)
     return written
+
+
+def _settle(
+    terminal: MT5Terminal,
+    info: SymbolInfo,
+    window_start: datetime,
+    window_end: datetime,
+    clock: ServerClock,
+    candles: list[Any],
+    options: dict[str, Any],
+) -> list[Any]:
+    """Re-ask while the answer still starts suspiciously late, and keep the fullest one."""
+    best = candles
+    for _ in range(max(int(options.get("history_retries", 3)), 1)):
+        if best and best[0][0] - window_start <= _LATE_FIRST_BAR:
+            break
+        time.sleep(_CATCH_UP_WAIT_SECONDS)
+        again = copy_rates(terminal, info.raw_symbol, window_start, window_end, clock, retries=1)
+        if len(again) > len(best):
+            best = again
+        elif again == best:
+            break
+    if best and best[0][0] - window_start > _LATE_FIRST_BAR:
+        log_event(
+            logger, "info", "candles.symbol.late_start",
+            symbol=info.symbol, requested_from=window_start.isoformat(),
+            first_bar=best[0][0].isoformat(), rows=len(best),
+        )
+    return best
+
+
+_idle_logged: dict[str, datetime] = {}
+
+
+def _log_idle(terminal: MT5Terminal, info: SymbolInfo, last: datetime, now: datetime) -> None:
+    """A symbol whose feed stopped writes nothing and used to log nothing. Say so once a day,
+    with what the terminal itself reports, so a dead feed is not mistaken for a stuck sync."""
+    if now - last < _IDLE_LOG_EVERY:
+        return
+    seen = _idle_logged.get(info.symbol)
+    if seen is not None and now - seen < _IDLE_LOG_EVERY:
+        return
+    _idle_logged[info.symbol] = now
+    detail: dict[str, Any] = {}
+    try:
+        row = terminal.mt5.symbol_info(info.raw_symbol)
+        if row is not None:
+            detail = {"trade_mode": int(row.trade_mode), "last_quote_label": int(row.time)}
+    except Exception:
+        pass
+    log_event(
+        logger, "warning", "candles.symbol.idle",
+        symbol=info.symbol, raw_symbol=info.raw_symbol, last_candle=last.isoformat(),
+        idle_hours=int((now - last).total_seconds() // 3600), **detail,
+    )
+
+
+def _parse_since(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    else:
+        moment = datetime.fromisoformat(str(value))
+    return moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment
+
+
+def _run_repair(
+    terminal: MT5Terminal,
+    client: Any,
+    clock: ServerClock,
+    connection: Any,
+    worker_id: str,
+    options: dict[str, Any],
+    since: datetime | None,
+) -> None:
+    """Fill holes inside history: re-read a trailing window from the terminal and insert only
+    the minutes ClickHouse does not have. Normal passes only ever move forward from the
+    watermark, so without this a hole, once skipped, stays forever."""
+    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    start = end - timedelta(days=int(options.get("repair_lookback_days", 7)))
+    if since is not None and since < start:
+        start = max(since, options["start_date"])
+    marks = clickhouse.watermarks(client)
+    found = list_symbols(terminal, options["suffixes"], options["path_prefixes"])
+    chosen, _ = resolve(found)
+    total = 0
+    for info in sorted(chosen.values(), key=lambda item: item.symbol):
+        last = marks.get(info.symbol)
+        if last is None or last <= start:
+            continue
+        _report(connection, worker_id, WorkerState.running, phase="repair", symbol=info.symbol)
+        try:
+            total += _repair_symbol(terminal, client, clock, info, start, min(last, end), options)
+        except TerminalError:
+            raise
+        except Exception as exc:
+            log_event(
+                logger, "warning", "candles.repair.failed",
+                symbol=info.symbol, error=f"{type(exc).__name__}: {exc}",
+            )
+    log_event(logger, "info", "candles.repair.completed", since=start.isoformat(), rows=total)
+
+
+def _repair_symbol(
+    terminal: MT5Terminal,
+    client: Any,
+    clock: ServerClock,
+    info: SymbolInfo,
+    start: datetime,
+    end: datetime,
+    options: dict[str, Any],
+) -> int:
+    filled = 0
+    for window_start, window_end in chunks(start, end, options["chunk_days"]):
+        candles = copy_rates(terminal, info.raw_symbol, window_start, window_end, clock, retries=1)
+        if not candles:
+            continue
+        have = clickhouse.existing_minutes(client, info.symbol, window_start, window_end)
+        missing = [
+            [info.symbol, moment, open_, high, low, close, tick_volume, real_volume, spread]
+            for moment, open_, high, low, close, tick_volume, real_volume, spread in candles
+            if moment not in have
+        ]
+        for offset in range(0, len(missing), _INSERT_BATCH):
+            filled += clickhouse.insert_candles(client, missing[offset: offset + _INSERT_BATCH])
+    if filled:
+        log_event(
+            logger, "info", "candles.repair.filled",
+            symbol=info.symbol, rows=filled, since=start.isoformat(), until=end.isoformat(),
+        )
+    return filled
 
 
 def _report(
