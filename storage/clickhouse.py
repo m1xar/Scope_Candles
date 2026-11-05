@@ -58,6 +58,22 @@ _DDL = (
     ENGINE = ReplacingMergeTree(updated_at)
     ORDER BY symbol
     """,
+    # Monitoring state per symbol, kept apart from `symbols` so neither the catalogue upsert
+    # nor older code that writes it can reset a status: active/delisted and whether the history
+    # backfill has finished. Symbols are never deleted, only marked.
+    """
+    CREATE TABLE IF NOT EXISTS symbol_state (
+        symbol        LowCardinality(String),
+        status        LowCardinality(String),
+        backfill      LowCardinality(String),
+        first_seen_at Nullable(DateTime('UTC')),
+        last_seen_at  Nullable(DateTime('UTC')),
+        delisted_at   Nullable(DateTime('UTC')),
+        updated_at    DateTime64(3, 'UTC') DEFAULT now64(3)
+    )
+    ENGINE = ReplacingMergeTree(updated_at)
+    ORDER BY symbol
+    """,
 )
 
 _FINAL = {"do_not_merge_across_partitions_select_final": 1}
@@ -144,6 +160,40 @@ def existing_minutes(client: Any, symbol: str, start: datetime, end: datetime) -
     return {_utc(row[0]) for row in result.result_rows}
 
 
+def symbol_states(client: Any) -> dict[str, Any]:
+    from symbols.catalog import SymbolState
+
+    result = client.query(
+        """
+        SELECT symbol, status, backfill, first_seen_at, last_seen_at, delisted_at
+        FROM symbol_state FINAL
+        """,
+        settings=_FINAL,
+    )
+    return {
+        row[0]: SymbolState(
+            symbol=row[0], status=row[1], backfill=row[2],
+            first_seen_at=_maybe_utc(row[3]), last_seen_at=_maybe_utc(row[4]),
+            delisted_at=_maybe_utc(row[5]),
+        )
+        for row in result.result_rows
+    }
+
+
+def write_symbol_states(client: Any, states: Iterable[Any]) -> int:
+    payload = [
+        [s.symbol, s.status, s.backfill, s.first_seen_at, s.last_seen_at, s.delisted_at]
+        for s in states
+    ]
+    if not payload:
+        return 0
+    client.insert(
+        "symbol_state", payload,
+        column_names=["symbol", "status", "backfill", "first_seen_at", "last_seen_at", "delisted_at"],
+    )
+    return len(payload)
+
+
 def known_symbols(client: Any) -> list[dict[str, Any]]:
     result = client.query(
         """
@@ -184,6 +234,10 @@ def symbol_exists(client: Any, symbol: str) -> bool:
         "SELECT count() FROM symbols WHERE symbol = {symbol:String}", parameters={"symbol": symbol}
     )
     return bool(result.result_rows and result.result_rows[0][0])
+
+
+def _maybe_utc(value: datetime | None) -> datetime | None:
+    return None if value is None else _utc(value)
 
 
 def _utc(value: datetime) -> datetime:

@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     repair_interval_hours: float = 6.0
     repair_lookback_days: int = 7
     repair_since: str = ""
+    catalog_refresh_hours: float = 24.0
+    catalog_min_ratio: float = 0.5
+    backfill_budget_seconds: float = 240.0
+    backfill_pause_seconds: float = 0.5
     prune_cache: bool = False
 
     tick_poll_ms: int = 300
@@ -42,6 +46,10 @@ class Settings(BaseSettings):
 
     symbol_suffixes: str = ""
     symbol_include_path_prefixes: str = ""
+    # Optional groups (stocks, ETFs) on top of the base ones; off while SYMBOL_EXTRA_MAX=0.
+    symbol_extra_path_prefixes: str = ""
+    symbol_extra_allowlist: str = ""
+    symbol_extra_max: int = 0
 
     max_rows: int = 50000
     freshness_lag_minutes: int = 15
@@ -64,6 +72,14 @@ class Settings(BaseSettings):
     @property
     def path_prefixes(self) -> list[str]:
         return [part.strip() for part in self.symbol_include_path_prefixes.split(",") if part.strip()]
+
+    @property
+    def extra_path_prefixes(self) -> list[str]:
+        return [part.strip() for part in self.symbol_extra_path_prefixes.split(",") if part.strip()]
+
+    @property
+    def extra_allowlist(self) -> list[str]:
+        return [part.strip().upper() for part in self.symbol_extra_allowlist.split(",") if part.strip()]
 
     @property
     def terminals(self) -> dict[str, str]:
