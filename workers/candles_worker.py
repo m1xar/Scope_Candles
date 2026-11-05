@@ -8,10 +8,7 @@ from typing import Any
 
 from mt5.cache import prune_price_cache
 from mt5.clock import ServerClock, measure_history_clock
-from mt5.fetch import (
-    TIMEFRAME_D1, TIMEFRAME_H1, HistorySync, chunks, copy_rates, last_quote_at, list_symbols, log_clock,
-    select, sync_history,
-)
+from mt5.fetch import chunks, copy_rates, daily_history, last_quote_at, list_symbols, log_clock, select
 from mt5.terminal import MT5Terminal, TerminalError
 from storage import clickhouse
 from symbols.catalog import BACKFILL_DONE, BACKFILL_PENDING, SymbolState, limit_extra, reconcile
@@ -59,9 +56,7 @@ def worker_main(worker_id: str, terminal_path: str, connection: Any, **options: 
     catalog: dict[str, SymbolInfo] = {}
     states: dict[str, SymbolState] = {}
     catalog_due_at = 0.0
-    # The first repair waits for the terminal to finish syncing after (re)connect: run straight
-    # away it would read the same incomplete local history the catch-up just read.
-    repair_due_at = time.monotonic() + float(options.get("repair_warmup_seconds") or 0)
+    repair_due_at = 0.0
     repair_since = _parse_since(options.get("repair_since"))
     try:
         while True:
@@ -261,20 +256,12 @@ def _sync_symbol(
         return 0
 
     catching_up = last is not None and end - start > _CATCH_UP_LAG
-    reference: list[datetime] | None = None
     if catching_up:
         quote = last_quote_at(terminal, info.raw_symbol, clock)
         if quote is not None and last is not None and quote < last + timedelta(minutes=1):
             # The broker has not quoted it since our last candle: a stopped feed, not a hole.
             _log_idle(terminal, info, last, end)
             return 0
-        # Have the terminal fetch the server's history for the whole gap first and keep the
-        # hourly bars as the yardstick for what each M1 answer must cover.
-        reference = sync_history(
-            terminal, info.raw_symbol, start, end, clock,
-            timeframe=TIMEFRAME_H1, attempts=int(options.get("history_retries", 3)) + 1,
-            wait_seconds=_CATCH_UP_WAIT_SECONDS,
-        ).times
 
     written = 0
     highest = last
@@ -286,9 +273,7 @@ def _sync_symbol(
         )
         retries = 1
         if catching_up:
-            candles = _settle(
-                terminal, info, window_start, window_end, clock, candles, options, reference
-            )
+            candles = _settle(terminal, info, window_start, window_end, clock, candles, options)
         if not candles:
             continue
         for moment, open_, high, low, close, tick_volume, real_volume, spread in candles:
@@ -310,18 +295,6 @@ def _sync_symbol(
     return written
 
 
-def missing_hours(
-    candles: list[Any], reference: list[datetime] | None, start: datetime, end: datetime
-) -> list[datetime]:
-    """Hours the coarse reference says traded inside [start, end) that the M1 answer lacks."""
-    if not reference:
-        return []
-    covered = {moment.replace(minute=0, second=0, microsecond=0) for moment, *_ in candles}
-    hour = timedelta(hours=1)
-    # Only whole hours inside the window: a partial edge hour may legitimately be empty here.
-    return [at for at in reference if start <= at and at + hour <= end and at not in covered]
-
-
 def _settle(
     terminal: MT5Terminal,
     info: SymbolInfo,
@@ -330,37 +303,24 @@ def _settle(
     clock: ServerClock,
     candles: list[Any],
     options: dict[str, Any],
-    reference: list[datetime] | None = None,
 ) -> list[Any]:
-    """Re-ask while the answer still looks short and keep the fullest one.
-
-    Short means: an hour the H1 reference has is missing from M1, or (no reference) the first
-    bar comes more than an hour after the window opens."""
-
-    def short(answer: list[Any]) -> bool:
-        if reference:
-            return bool(missing_hours(answer, reference, window_start, window_end))
-        return not answer or answer[0][0] - window_start > _LATE_FIRST_BAR
-
-    if reference is not None and not reference:
-        return candles  # the server itself has nothing in the gap (closed market)
-    best = candles
+    """Catch-up only: ask the same window again (HISTORY_RETRIES times, 2 s apart) and keep
+    the fullest answer. Stops as soon as an answer repeats the previous one: asking again
+    would only return the same thing."""
+    best = previous = candles
     for _ in range(max(int(options.get("history_retries", 3)), 1)):
-        if not short(best):
-            break
         time.sleep(_CATCH_UP_WAIT_SECONDS)
         again = copy_rates(terminal, info.raw_symbol, window_start, window_end, clock, retries=1)
         if len(again) > len(best):
             best = again
-        elif again == best:
+        if again == previous:
             break
-    if short(best):
-        gaps = missing_hours(best, reference, window_start, window_end)
+        previous = again
+    if best and best[0][0] - window_start > _LATE_FIRST_BAR:
         log_event(
-            logger, "info", "candles.symbol.late_start" if not gaps else "candles.symbol.incomplete",
+            logger, "info", "candles.symbol.late_start",
             symbol=info.symbol, requested_from=window_start.isoformat(),
-            first_bar=best[0][0].isoformat() if best else None, rows=len(best),
-            missing_hours=len(gaps), first_missing=gaps[0].isoformat() if gaps else None,
+            first_bar=best[0][0].isoformat(), rows=len(best),
         )
     return best
 
@@ -467,10 +427,9 @@ def _backfill_symbol(
         # Daily bars over the whole range: a few thousand rows, and the request makes the
         # terminal download the full M1 history it is built from. The first one tells where
         # the broker's history actually starts, so empty years are not walked month by month.
-        daily = sync_history(
+        daily = daily_history(
             terminal, info.raw_symbol, options["start_date"], end, clock,
-            timeframe=TIMEFRAME_D1, attempts=int(options.get("history_retries", 3)) + 2,
-            wait_seconds=3.0,
+            attempts=int(options.get("history_retries", 3)) + 2,
         )
         if not daily.stable:
             # Still downloading: a first bar read now could be later than the real one and
@@ -496,18 +455,10 @@ def _backfill_symbol(
     for window_start, window_end in chunks(start, end, options["chunk_days"]):
         if time.monotonic() >= deadline:
             return False
-        reference = sync_history(
-            terminal, info.raw_symbol, window_start, window_end, clock,
-            timeframe=TIMEFRAME_H1, attempts=3, wait_seconds=_CATCH_UP_WAIT_SECONDS,
-        ).times
         candles = copy_rates(
             terminal, info.raw_symbol, window_start, window_end, clock,
             retries=options["history_retries"],
         )
-        if reference:
-            candles = _settle(
-                terminal, info, window_start, window_end, clock, candles, options, reference
-            )
         rows = [
             [info.symbol, moment, open_, high, low, close, tick_volume, real_volume, spread]
             for moment, open_, high, low, close, tick_volume, real_volume, spread in candles
@@ -529,7 +480,7 @@ def _backfill_symbol(
     return True
 
 
-# --- repair: re-read from the verified cursor ------------------------------------------------
+# --- repair: re-read the last days, insert only missing minutes ------------------------------
 
 
 def _parse_since(value: Any) -> datetime | None:
@@ -540,34 +491,6 @@ def _parse_since(value: Any) -> datetime | None:
     else:
         moment = datetime.fromisoformat(str(value))
     return moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment
-
-
-def repair_window(
-    now: datetime,
-    last: datetime,
-    cursor: datetime | None,
-    options: dict[str, Any],
-    since: datetime | None = None,
-) -> tuple[datetime, datetime] | None:
-    """What one repair run re-reads for a symbol.
-
-    Always the trailing REPAIR_LOOKBACK_DAYS, and further back to the symbol's verified cursor
-    when that is older: after an outage of any length the cursor still sits where the outage
-    began, so the hole is swept without anyone setting REPAIR_SINCE. One run covers at most
-    REPAIR_MAX_DAYS so a long sweep is spread over several runs."""
-    start = now - timedelta(days=int(options.get("repair_lookback_days", 7)))
-    if cursor is not None and cursor < start:
-        start = cursor
-    if since is not None and since < start:
-        start = since
-    start = max(start, options["start_date"])
-    stop = min(last, now)
-    span = int(options.get("repair_max_days") or 0)
-    if span > 0:
-        stop = min(stop, start + timedelta(days=span))
-    if stop <= start:
-        return None
-    return start, stop
 
 
 def _run_repair(
@@ -581,27 +504,24 @@ def _run_repair(
     states: dict[str, SymbolState],
     since: datetime | None,
 ) -> None:
-    """Fill holes inside history: re-read a window from the terminal and insert only the
-    minutes ClickHouse does not have. Normal passes only ever move forward from the
-    watermark, so without this a hole, once skipped, stays forever."""
-    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    min_age = timedelta(hours=float(options.get("repair_min_age_hours") or 0))
+    """Fill holes inside history: re-read the trailing REPAIR_LOOKBACK_DAYS (or from
+    REPAIR_SINCE once) from the terminal and insert only the minutes ClickHouse does not have.
+    Normal passes only ever move forward from the watermark, so without this a hole, once
+    skipped, stays forever."""
+    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    start = end - timedelta(days=int(options.get("repair_lookback_days", 7)))
+    if since is not None and since < start:
+        start = max(since, options["start_date"])
     marks = clickhouse.watermarks(client)
-    cursors = clickhouse.repair_cursors(client)
     total = 0
-    swept = 0
     for symbol in sorted(catalog):
         info = catalog[symbol]
         last = marks.get(symbol)
-        if last is None or not _state(states, symbol).ready:
+        if last is None or last <= start or not _state(states, symbol).ready:
             continue
-        window = repair_window(now, last, cursors.get(symbol), options, since)
-        if window is None:
-            continue
-        start, stop = window
         _report(connection, worker_id, WorkerState.running, phase="repair", symbol=symbol)
         try:
-            filled, verified = _repair_symbol(terminal, client, clock, info, start, stop, options)
+            total += _repair_symbol(terminal, client, clock, info, start, min(last, end), options)
         except TerminalError:
             raise
         except Exception as exc:
@@ -609,15 +529,7 @@ def _run_repair(
                 logger, "warning", "candles.repair.failed",
                 symbol=symbol, error=f"{type(exc).__name__}: {exc}",
             )
-            continue
-        total += filled
-        swept += 1
-        # Only history old enough for the terminal to have it in full counts as verified.
-        verified = min(verified, now - min_age)
-        previous = cursors.get(symbol)
-        if previous is None or verified > previous:
-            clickhouse.set_repair_cursor(client, symbol, verified)
-    log_event(logger, "info", "candles.repair.completed", symbols=swept, rows=total)
+    log_event(logger, "info", "candles.repair.completed", since=start.isoformat(), rows=total)
 
 
 def _repair_symbol(
@@ -628,28 +540,10 @@ def _repair_symbol(
     start: datetime,
     end: datetime,
     options: dict[str, Any],
-) -> tuple[int, datetime]:
-    """Returns (rows inserted, verified-until). Verification stops at the first window whose
-    M1 answer still lacks hours the hourly reference has: that part is retried next run."""
+) -> int:
     filled = 0
-    verified = start
-    complete = True
     for window_start, window_end in chunks(start, end, options["chunk_days"]):
-        synced = sync_history(
-            terminal, info.raw_symbol, window_start, window_end, clock,
-            timeframe=TIMEFRAME_H1, attempts=3, wait_seconds=1.0,
-        )
-        reference = synced.times
         candles = copy_rates(terminal, info.raw_symbol, window_start, window_end, clock, retries=1)
-        if reference:
-            candles = _settle(
-                terminal, info, window_start, window_end, clock, candles, options, reference
-            )
-        if complete:
-            if not synced.stable or missing_hours(candles, reference, window_start, window_end):
-                complete = False
-            else:
-                verified = window_end
         if not candles:
             continue
         have = clickhouse.existing_minutes(client, info.symbol, window_start, window_end)
@@ -665,7 +559,7 @@ def _repair_symbol(
             logger, "info", "candles.repair.filled",
             symbol=info.symbol, rows=filled, since=start.isoformat(), until=end.isoformat(),
         )
-    return filled, verified
+    return filled
 
 
 # --- helpers -------------------------------------------------------------------------------

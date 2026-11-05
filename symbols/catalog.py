@@ -48,10 +48,6 @@ class CatalogChange:
     rows: list[SymbolState]
 
 
-def split_prefixes(value: str) -> list[str]:
-    return [part.strip() for part in (value or "").split(",") if part.strip()]
-
-
 def limit_extra(
     found: Iterable[SymbolInfo],
     extra_prefixes: list[str],

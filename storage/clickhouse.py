@@ -74,17 +74,6 @@ _DDL = (
     ENGINE = ReplacingMergeTree(updated_at)
     ORDER BY symbol
     """,
-    # How far each series has been re-read from the terminal and found complete. Repair
-    # resumes from here, so an outage of any length is swept once, without REPAIR_SINCE.
-    """
-    CREATE TABLE IF NOT EXISTS repair_state (
-        symbol      LowCardinality(String),
-        verified_ts DateTime('UTC'),
-        updated_at  DateTime64(3, 'UTC') DEFAULT now64(3)
-    )
-    ENGINE = ReplacingMergeTree(updated_at)
-    ORDER BY symbol
-    """,
 )
 
 _FINAL = {"do_not_merge_across_partitions_select_final": 1}
@@ -203,26 +192,6 @@ def write_symbol_states(client: Any, states: Iterable[Any]) -> int:
         column_names=["symbol", "status", "backfill", "first_seen_at", "last_seen_at", "delisted_at"],
     )
     return len(payload)
-
-
-def repair_cursors(client: Any) -> dict[str, datetime]:
-    result = client.query("SELECT symbol, verified_ts FROM repair_state FINAL", settings=_FINAL)
-    return {row[0]: _utc(row[1]) for row in result.result_rows if row[1] is not None}
-
-
-def set_repair_cursor(client: Any, symbol: str, verified_ts: datetime) -> None:
-    client.insert("repair_state", [[symbol, verified_ts]], column_names=["symbol", "verified_ts"])
-
-
-def minute_count(client: Any, symbol: str, start: datetime, end: datetime) -> int:
-    result = client.query(
-        """
-        SELECT uniqExact(ts) FROM candles
-        WHERE symbol = {symbol:String} AND ts >= {start:DateTime} AND ts < {end:DateTime}
-        """,
-        parameters={"symbol": symbol, "start": start, "end": end},
-    )
-    return int(result.result_rows[0][0]) if result.result_rows else 0
 
 
 def known_symbols(client: Any) -> list[dict[str, Any]]:

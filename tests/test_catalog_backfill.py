@@ -1,9 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 import workers.candles_worker as worker
 from mt5.clock import ServerClock
+from mt5.fetch import HistorySync
 from symbols.catalog import (
     ACTIVE, BACKFILL_DONE, BACKFILL_PENDING, DELISTED, SymbolState, limit_extra, reconcile,
 )
@@ -100,10 +99,6 @@ class Market:
             rows = [c for c in rows if c[0] >= cut]
         return rows
 
-    def hours(self, raw, start, end):
-        seen = sorted({c[0].replace(minute=0) for c in self.series.get(raw, [])})
-        return [h for h in seen if start <= h + timedelta(hours=1) and h < end]
-
     def days(self, raw, start, end):
         seen = sorted({c[0].replace(hour=0, minute=0) for c in self.series.get(raw, [])})
         return [d for d in seen if start <= d < end]
@@ -113,7 +108,6 @@ class FakeCH:
     def __init__(self):
         self.rows = {}
         self.marks = {}
-        self.cursors = {}
         self.states = []
 
     def minutes(self, symbol):
@@ -124,10 +118,8 @@ def wire(monkeypatch, market, ch, now=NOW, quote=None):
     def copy_rates(_t, raw, start, end, _clock, retries=1):
         return market.m1(raw, start, end)
 
-    def sync_history(_t, raw, start, end, _clock, timeframe=worker.TIMEFRAME_H1, **_kw):
-        if timeframe == worker.TIMEFRAME_D1:
-            return worker.HistorySync(market.days(raw, start, end), True)
-        return worker.HistorySync(market.hours(raw, start, end), True)
+    def daily_history(_t, raw, start, end, _clock, **_kw):
+        return HistorySync(market.days(raw, start, end), True)
 
     def insert(_c, rows):
         for row in rows:
@@ -135,7 +127,7 @@ def wire(monkeypatch, market, ch, now=NOW, quote=None):
         return len(rows)
 
     monkeypatch.setattr(worker, "copy_rates", copy_rates)
-    monkeypatch.setattr(worker, "sync_history", sync_history)
+    monkeypatch.setattr(worker, "daily_history", daily_history)
     monkeypatch.setattr(worker, "last_quote_at", lambda _t, raw, _c: quote(raw) if quote else None)
     monkeypatch.setattr(worker, "select", lambda *_: True)
     monkeypatch.setattr(worker.time, "sleep", lambda *_: None)
@@ -151,10 +143,6 @@ def wire(monkeypatch, market, ch, now=NOW, quote=None):
         worker.clickhouse, "existing_minutes",
         lambda _c, s, a, b: {ts for ts in ch.minutes(s) if a <= ts < b},
     )
-    monkeypatch.setattr(worker.clickhouse, "repair_cursors", lambda _c: dict(ch.cursors))
-    monkeypatch.setattr(
-        worker.clickhouse, "set_repair_cursor", lambda _c, s, ts: ch.cursors.__setitem__(s, ts)
-    )
     monkeypatch.setattr(worker.clickhouse, "write_symbol_states", lambda _c, rows: ch.states.extend(rows))
 
 
@@ -167,8 +155,7 @@ class Terminal:
 
 OPTIONS = {
     "start_date": START, "chunk_days": 30, "history_retries": 3,
-    "repair_lookback_days": 7, "repair_max_days": 31, "repair_min_age_hours": 2,
-    "backfill_pause_seconds": 0,
+    "repair_lookback_days": 7, "backfill_pause_seconds": 0,
 }
 
 
@@ -186,15 +173,15 @@ def _frozen(moment):
     return Frozen
 
 
-# --- catch-up and the 5-day outage -----------------------------------------------------------
+# --- catch-up and repair --------------------------------------------------------------------
 
 
-def test_catch_up_retries_when_hours_are_missing_in_the_middle(monkeypatch):
-    # Not only a late start: the answer has the edges of the gap but not its middle.
+def test_catch_up_keeps_the_fullest_of_repeated_answers(monkeypatch):
+    # The answer has the edges of the gap but not its middle; a later ask has it all.
     last = NOW - timedelta(days=2)
     full = bars(last + timedelta(minutes=1), NOW)
     holey = [c for c in full if not (NOW - timedelta(hours=30) <= c[0] < NOW - timedelta(hours=20))]
-    answers = [holey, full]
+    answers = [holey, holey[:-5], full, full]
     market = Market({"US500": full})
     market.m1 = lambda raw, a, b: [c for c in (answers.pop(0) if len(answers) > 1 else answers[0]) if a <= c[0] < b]
     ch = FakeCH()
@@ -202,6 +189,30 @@ def test_catch_up_retries_when_hours_are_missing_in_the_middle(monkeypatch):
     wire(monkeypatch, market, ch)
     written = worker._sync_symbol(Terminal(), None, ServerClock(), info("US500"), dict(ch.marks), OPTIONS)
     assert written == len(full)
+
+
+def test_catch_up_stops_when_the_answer_repeats(monkeypatch):
+    last = NOW - timedelta(days=2)
+    same = bars(NOW - timedelta(days=1), NOW)
+    market = Market({"US500": same})
+    ch = FakeCH()
+    ch.marks["US500"] = last
+    wire(monkeypatch, market, ch)
+    worker._sync_symbol(Terminal(), None, ServerClock(), info("US500"), dict(ch.marks), OPTIONS)
+    assert market.calls == 2  # first ask + one re-ask that came back identical
+
+
+def test_catch_up_asks_at_most_history_retries_more(monkeypatch):
+    last = NOW - timedelta(days=2)
+    full = bars(last + timedelta(minutes=1), NOW)
+    market = Market({"US500": full})
+    grow = iter(range(1, 100))
+    market.m1 = lambda raw, a, b: (setattr(market, "calls", market.calls + 1) or full[-next(grow) * 60:])
+    ch = FakeCH()
+    ch.marks["US500"] = last
+    wire(monkeypatch, market, ch)
+    worker._sync_symbol(Terminal(), None, ServerClock(), info("US500"), dict(ch.marks), OPTIONS)
+    assert market.calls == 1 + OPTIONS["history_retries"]
 
 
 def test_dead_feed_is_not_waited_on(monkeypatch):
@@ -215,20 +226,17 @@ def test_dead_feed_is_not_waited_on(monkeypatch):
     assert market.calls == 0
 
 
-@pytest.mark.parametrize("outage_days", [5, 20])
-def test_outage_heals_without_repair_since(monkeypatch, outage_days):
-    """Worker down 5 days. On restart the terminal keeps answering with only the last day
-    (it has not downloaded the rest yet), so the catch-up writes a partial series and the
-    watermark jumps. The next repair starts from the verified cursor left before the outage,
-    reads the full history the terminal has by then, and fills the hole."""
-    outage_start = NOW - timedelta(days=outage_days, hours=1)
-    full = bars(NOW - timedelta(days=outage_days + 7), NOW)
+def test_five_day_outage_hole_is_filled_by_the_next_repair(monkeypatch):
+    """Worker down 5 days. On restart the terminal answers with only the last day, so the
+    catch-up writes a partial series and the watermark jumps. The repair six hours later
+    re-reads the last 7 days, which the terminal has by then, and fills the hole."""
+    outage_start = NOW - timedelta(days=5, hours=1)
+    full = bars(NOW - timedelta(days=12), NOW)
     before = [c for c in full if c[0] < outage_start]
     ch = FakeCH()
     for c in before:
         ch.rows[("AUDJPY", c[0])] = ("AUDJPY",) + c
     ch.marks["AUDJPY"] = before[-1][0]
-    ch.cursors["AUDJPY"] = outage_start - timedelta(hours=2)  # verified before the outage
 
     market = Market({"AUDJPY": full}, local_from={"AUDJPY": NOW - timedelta(days=1)}, lag_calls=10**6)
     wire(monkeypatch, market, ch)
@@ -237,44 +245,19 @@ def test_outage_heals_without_repair_since(monkeypatch, outage_days):
     assert ch.marks["AUDJPY"] == full[-1][0]  # watermark jumped
     assert not any(("AUDJPY", ts) in ch.rows for ts in hole[:10])  # the hole is there
 
-    # Six hours later the terminal has the whole history locally.
-    later = NOW + timedelta(hours=6)
     market.lag_calls = 0
-    wire(monkeypatch, market, ch, now=later)
-    catalog = {"AUDJPY": info("AUDJPY")}
-    states = {"AUDJPY": SymbolState("AUDJPY", ACTIVE, BACKFILL_DONE)}
+    wire(monkeypatch, market, ch, now=NOW + timedelta(hours=6))
+    catalog = {"AUDJPY": info("AUDJPY"), "COPPER": info("COPPER"), "XAUCHF": info("XAUCHF")}
+    states = {
+        "AUDJPY": SymbolState("AUDJPY", ACTIVE, BACKFILL_DONE),
+        "COPPER": SymbolState("COPPER", ACTIVE, BACKFILL_PENDING),
+        "XAUCHF": SymbolState("XAUCHF", DELISTED, BACKFILL_DONE),
+    }
+    ch.marks.update({"COPPER": NOW, "XAUCHF": NOW})
     worker._run_repair(Terminal(), None, ServerClock(), Pipe(), "candles", OPTIONS, catalog, states, None)
 
     assert all(("AUDJPY", ts) in ch.rows for ts in hole)
-    assert ch.cursors["AUDJPY"] > NOW - timedelta(days=1)
-
-
-def test_repair_does_not_advance_cursor_over_a_hole_it_could_not_fill(monkeypatch):
-    full = bars(NOW - timedelta(days=10), NOW)
-    ch = FakeCH()
-    ch.marks["AUDJPY"] = full[-1][0]
-    cursor = NOW - timedelta(days=9)
-    ch.cursors["AUDJPY"] = cursor
-    # Terminal never gets past the last 2 days: hours before that stay missing in every answer.
-    market = Market({"AUDJPY": full}, local_from={"AUDJPY": NOW - timedelta(days=2)}, lag_calls=10**6)
-    wire(monkeypatch, market, ch)
-    catalog = {"AUDJPY": info("AUDJPY")}
-    states = {"AUDJPY": SymbolState("AUDJPY", ACTIVE, BACKFILL_DONE)}
-    worker._run_repair(Terminal(), None, ServerClock(), Pipe(), "candles", OPTIONS, catalog, states, None)
-    assert ch.cursors["AUDJPY"] == cursor
-
-
-def test_repair_window_rules():
-    last = NOW
-    assert worker.repair_window(NOW, last, None, OPTIONS) == (NOW - timedelta(days=7), NOW)
-    old = NOW - timedelta(days=20)
-    assert worker.repair_window(NOW, last, old, OPTIONS) == (old, NOW)
-    very_old = NOW - timedelta(days=90)
-    assert worker.repair_window(NOW, last, very_old, OPTIONS) == (very_old, very_old + timedelta(days=31))
-    since = datetime(2026, 9, 1, tzinfo=UTC)
-    assert worker.repair_window(NOW, last, None, OPTIONS, since)[0] == since
-    dead = datetime(2026, 5, 15, tzinfo=UTC)
-    assert worker.repair_window(NOW, dead, None, OPTIONS) is None
+    assert ch.minutes("COPPER") == [] and ch.minutes("XAUCHF") == []  # queued / delisted skipped
 
 
 # --- backfill of new symbols -----------------------------------------------------------------
@@ -307,7 +290,7 @@ def test_backfill_waits_while_terminal_history_is_still_loading(monkeypatch):
     market = Market({"NEW": bars(NOW - timedelta(days=3), NOW)})
     ch = FakeCH()
     wire(monkeypatch, market, ch)
-    monkeypatch.setattr(worker, "sync_history", lambda *a, **k: worker.HistorySync([NOW], False))
+    monkeypatch.setattr(worker, "daily_history", lambda *a, **k: HistorySync([NOW], False))
     monkeypatch.setattr(worker.time, "monotonic", lambda: 0)
     assert worker._backfill_symbol(Terminal(), None, ServerClock(), info("NEW"), {}, OPTIONS, deadline=1) is False
     assert ch.minutes("NEW") == []
@@ -337,18 +320,10 @@ def test_regular_pass_skips_queued_and_backfill_marks_done(monkeypatch):
     assert len(ch.minutes("COPPER")) == len(market.series["COPPER"])
 
 
-def test_missing_hours_ignores_partial_edge_hours():
-    start = NOW.replace(minute=31)
-    end = NOW + timedelta(hours=3, minutes=10)
-    reference = [NOW, NOW + timedelta(hours=1), NOW + timedelta(hours=2), NOW + timedelta(hours=3)]
-    candles = bars(NOW + timedelta(hours=1), NOW + timedelta(hours=2))
-    assert worker.missing_hours(candles, reference, start, end) == [NOW + timedelta(hours=2)]
-
-
 # --- terminal helpers and the catalogue refresh ----------------------------------------------
 
 
-def test_sync_history_waits_until_two_answers_agree(monkeypatch):
+def test_daily_history_waits_until_two_answers_agree(monkeypatch):
     import mt5.fetch as fetch
 
     answers = [[], [{"time": 1}], [{"time": 1}, {"time": 3601}], [{"time": 1}, {"time": 3601}]]
@@ -364,10 +339,10 @@ def test_sync_history_waits_until_two_answers_agree(monkeypatch):
                 return (1, "Success")
 
     monkeypatch.setattr(fetch.time, "sleep", lambda *_: None)
-    synced = fetch.sync_history(T(), "X", NOW - timedelta(days=1), NOW, ServerClock(), attempts=6)
+    synced = fetch.daily_history(T(), "X", NOW - timedelta(days=1), NOW, ServerClock(), attempts=6)
     assert synced.stable and len(synced.times) == 2
     answers[:] = [[], [{"time": 1}], [{"time": 1}, {"time": 3601}]]
-    assert not fetch.sync_history(T(), "X", NOW - timedelta(days=1), NOW, ServerClock(), attempts=3).stable
+    assert not fetch.daily_history(T(), "X", NOW - timedelta(days=1), NOW, ServerClock(), attempts=3).stable
 
 
 def test_refresh_catalog_writes_states_and_respects_extra_switch(monkeypatch):

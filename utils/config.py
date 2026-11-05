@@ -35,9 +35,6 @@ class Settings(BaseSettings):
     repair_interval_hours: float = 6.0
     repair_lookback_days: int = 7
     repair_since: str = ""
-    repair_warmup_minutes: float = 20.0
-    repair_min_age_hours: float = 2.0
-    repair_max_days: int = 31
     catalog_refresh_hours: float = 24.0
     catalog_min_ratio: float = 0.5
     backfill_budget_seconds: float = 240.0

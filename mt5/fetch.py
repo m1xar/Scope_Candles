@@ -110,26 +110,24 @@ class HistorySync(NamedTuple):
     stable: bool
 
 
-def sync_history(
+def daily_history(
     terminal: MT5Terminal,
     raw_symbol: str,
     start: datetime,
     end: datetime,
     clock: ServerClock,
     *,
-    timeframe: int = TIMEFRAME_H1,
-    attempts: int = 4,
-    wait_seconds: float = 2.0,
+    attempts: int = 5,
+    wait_seconds: float = 3.0,
 ) -> HistorySync:
-    """Make the terminal pull the server's history for [start, end) before M1 is read.
+    """D1 bar opens (UTC) over [start, end) for a symbol whose history we do not hold yet.
 
-    The terminal keeps only M1 locally and builds every timeframe from it, so asking for the
-    same range on a coarse timeframe (a few hundred bars instead of tens of thousands) starts
-    the download just as an M1 request would. It is asked again until two answers agree,
-    which is the cheapest sign the download has landed. Returns the bar opens in UTC: a
-    reference for what M1 should cover; ``stable`` is False when the answers never agreed
-    (download still running). No bars with ``stable`` means the server has nothing there.
+    A few thousand rows instead of millions, and the request makes the terminal download the
+    M1 history the bars are built from. Asked again until two answers agree (the download has
+    landed); the first bar tells where the broker's history starts. ``stable`` is False when the
+    answers never agreed (still downloading). No bars with ``stable`` means no history at all.
     """
+    timeframe = TIMEFRAME_D1
     server_start = clock.to_server(start) or start.replace(tzinfo=None)
     server_end = clock.to_server(end) or end.replace(tzinfo=None)
     previous = -1
