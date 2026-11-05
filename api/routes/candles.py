@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from api.deps import COMMON_RESPONSES, get_clickhouse, verify_auth
 from storage import clickhouse
 from symbols.normalize import normalize
+from symbols.resolver import resolve_symbol
 from utils.config import settings
 
 router = APIRouter(tags=["Candles"], dependencies=[Depends(verify_auth)], responses=COMMON_RESPONSES)
@@ -28,6 +29,8 @@ class Candle(BaseModel):
 class CandleResponse(BaseModel):
     symbol: str
     raw_symbol: str
+    requested: str
+    matched_by: str
     timeframe: str
     start: datetime = Field(alias="from")
     end: datetime = Field(alias="to")
@@ -73,23 +76,31 @@ async def get_candles(
     if window_start >= window_end:
         raise HTTPException(status_code=400, detail="'from' must be earlier than 'to'")
 
-    def read() -> tuple[dict[str, Any] | None, int, list[dict[str, Any]]]:
+    def read() -> tuple[Any, dict[str, Any] | None, int, list[dict[str, Any]]]:
         with client.borrow() as connection:
-            known = clickhouse.get_symbol(connection, normalized)
-            if known is None:
-                return None, 0, []
+            found: dict[str, dict[str, Any] | None] = {}
+
+            def is_known(candidate: str) -> bool:
+                if candidate not in found:
+                    found[candidate] = clickhouse.get_symbol(connection, candidate)
+                return found[candidate] is not None
+
+            resolution = resolve_symbol(symbol, is_known, suffixes=settings.suffixes)
+            if resolution is None:
+                return None, None, 0, []
+            known = found[resolution.symbol]
             buckets = clickhouse.count_buckets(
-                connection, normalized, window_start, window_end, timeframe
+                connection, resolution.symbol, window_start, window_end, timeframe
             )
             if buckets > settings.max_rows:
-                return known, buckets, []
+                return resolution, known, buckets, []
             rows = clickhouse.select_candles(
-                connection, normalized, window_start, window_end, timeframe, settings.max_rows
+                connection, resolution.symbol, window_start, window_end, timeframe, settings.max_rows
             )
-            return known, buckets, rows
+            return resolution, known, buckets, rows
 
-    info, buckets, rows = await asyncio.to_thread(read)
-    if info is None:
+    resolution, info, buckets, rows = await asyncio.to_thread(read)
+    if resolution is None or info is None:
         raise HTTPException(status_code=404, detail="symbol not found")
     if buckets > settings.max_rows:
         raise HTTPException(
@@ -101,8 +112,10 @@ async def get_candles(
         )
 
     return CandleResponse(
-        symbol=normalized,
+        symbol=resolution.symbol,
         raw_symbol=info["raw_symbol"],
+        requested=symbol,
+        matched_by=resolution.matched_by,
         timeframe=timeframe,
         start=window_start,
         end=window_end,

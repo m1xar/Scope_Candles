@@ -6,6 +6,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 
+from symbols.normalize import DEFAULT_SUFFIXES
+
 _ENV_PREFIX = "MT5_CANDLES_"
 
 
@@ -67,7 +69,8 @@ class Settings(BaseSettings):
 
     @property
     def suffixes(self) -> list[str]:
-        return [part.strip() for part in self.symbol_suffixes.split(",") if part.strip()]
+        parts = [part.strip() for part in self.symbol_suffixes.split(",") if part.strip()]
+        return parts or list(DEFAULT_SUFFIXES)
 
     @property
     def path_prefixes(self) -> list[str]:
