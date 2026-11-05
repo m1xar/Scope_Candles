@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     backfill_chunk_days: int = 30
     backfill_start_date: str = ""
     symbol_history_retries: int = 3
+    repair_interval_hours: float = 6.0
+    repair_lookback_days: int = 7
+    repair_since: str = ""
     prune_cache: bool = False
 
     tick_poll_ms: int = 300

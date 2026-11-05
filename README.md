@@ -111,6 +111,15 @@ Redis holds only what is disposable: `price:{SYMBOL}` (the latest quote, 5 minut
 
 ---
 
+### Holes
+
+A pass only moves forward from the watermark (`last_ts + 1 minute`). Two things used to leave permanent holes behind it:
+
+- **Catch-up after an outage.** `copy_rates_range` answers from the terminal's local history and does not wait for the server: right after a reconnect it returns only the bars seen since then, with no error. The worker now re-asks (up to `SYMBOL_HISTORY_RETRIES`, 2 s apart) while a catch-up answer starts more than an hour late, keeps the fullest one, and logs `candles.symbol.late_start` if it still starts late.
+- **Repair.** Every `REPAIR_INTERVAL_HOURS` (default 6) the worker re-reads the last `REPAIR_LOOKBACK_DAYS` (default 7) from the terminal and inserts only the minutes ClickHouse does not have (`candles.repair.filled`). Set `REPAIR_SINCE=2026-09-01` once to sweep further back after a long outage. `REPAIR_INTERVAL_HOURS=0` turns it off.
+
+A symbol whose broker feed stopped (disabled, delisted, no quotes) writes nothing; it is logged once a day as `candles.symbol.idle` with the terminal's `trade_mode` and last quote time, so a dead feed is not mistaken for a stuck sync.
+
 ## API
 
 Every route except `/healthz` needs the shared bearer token from `MT5_CANDLES_API_TOKEN`. The WebSocket also accepts `?token=`, because a browser cannot set headers on a WS handshake. An empty token disables auth entirely, which is only acceptable on a closed network.

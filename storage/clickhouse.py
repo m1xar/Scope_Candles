@@ -133,6 +133,17 @@ def candle_watermark(client: Any, symbol: str) -> datetime | None:
     return value if value.year > 1970 else None
 
 
+def existing_minutes(client: Any, symbol: str, start: datetime, end: datetime) -> set[datetime]:
+    result = client.query(
+        """
+        SELECT DISTINCT ts FROM candles
+        WHERE symbol = {symbol:String} AND ts >= {start:DateTime} AND ts < {end:DateTime}
+        """,
+        parameters={"symbol": symbol, "start": start, "end": end},
+    )
+    return {_utc(row[0]) for row in result.result_rows}
+
+
 def known_symbols(client: Any) -> list[dict[str, Any]]:
     result = client.query(
         """
