@@ -27,8 +27,13 @@ class FakeCH:
         return len(rows)
 
 
-def patch(monkeypatch, ch, answers):
+def patch(monkeypatch, ch, answers, reference=None):
     calls = []
+    truth = reference if reference is not None else max(answers, key=len)
+    hours = sorted({c[0].replace(minute=0) for c in truth})
+
+    def sync_history(_t, _raw, start, end, _clock, **_kw):
+        return worker.HistorySync([h for h in hours if start <= h + timedelta(hours=1) and h < end], True)
 
     def copy_rates(_t, raw, start, end, _clock, retries=1):
         calls.append((start, end))
@@ -36,6 +41,8 @@ def patch(monkeypatch, ch, answers):
         return [c for c in answer if start <= c[0] < end]
 
     monkeypatch.setattr(worker, "copy_rates", copy_rates)
+    monkeypatch.setattr(worker, "sync_history", sync_history)
+    monkeypatch.setattr(worker, "last_quote_at", lambda *_: None)
     monkeypatch.setattr(worker, "select", lambda *_: True)
     monkeypatch.setattr(worker.time, "sleep", lambda *_: None)
     monkeypatch.setattr(worker.clickhouse, "insert_candles", lambda _c, rows: ch.insert(rows))
@@ -77,10 +84,11 @@ def test_repair_inserts_only_missing_minutes(monkeypatch):
     have = {c[0] for c in source[:100]} | {c[0] for c in source[400:]}
     ch = FakeCH(have)
     patch(monkeypatch, ch, [source])
-    filled = worker._repair_symbol(
+    filled, verified = worker._repair_symbol(
         FakeTerminal(), None, ServerClock(), INFO, T0, T0 + timedelta(hours=10), OPTIONS
     )
     assert filled == 300
+    assert verified == T0 + timedelta(hours=10)
     assert len(ch.rows) == 600
 
 
@@ -88,7 +96,8 @@ def test_repair_is_idempotent(monkeypatch):
     source = minutes(T0, 120)
     ch = FakeCH({c[0] for c in source})
     patch(monkeypatch, ch, [source])
-    assert worker._repair_symbol(FakeTerminal(), None, ServerClock(), INFO, T0, T0 + timedelta(hours=2), OPTIONS) == 0
+    filled, _ = worker._repair_symbol(FakeTerminal(), None, ServerClock(), INFO, T0, T0 + timedelta(hours=2), OPTIONS)
+    assert filled == 0
 
 
 def test_steady_state_does_not_wait(monkeypatch):

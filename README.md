@@ -111,14 +111,18 @@ Redis holds only what is disposable: `price:{SYMBOL}` (the latest quote, 5 minut
 
 ---
 
-### Holes
+### Catalogue, backfill and holes
 
-A pass only moves forward from the watermark (`last_ts + 1 minute`). Two things used to leave permanent holes behind it:
+The worker does four things, in this order, every `BACKFILL_INTERVAL_MINUTES`:
 
-- **Catch-up after an outage.** `copy_rates_range` answers from the terminal's local history and does not wait for the server: right after a reconnect it returns only the bars seen since then, with no error. The worker now re-asks (up to `SYMBOL_HISTORY_RETRIES`, 2 s apart) while a catch-up answer starts more than an hour late, keeps the fullest one, and logs `candles.symbol.late_start` if it still starts late.
-- **Repair.** Every `REPAIR_INTERVAL_HOURS` (default 6) the worker re-reads the last `REPAIR_LOOKBACK_DAYS` (default 7) from the terminal and inserts only the minutes ClickHouse does not have (`candles.repair.filled`). Set `REPAIR_SINCE=2026-09-01` once to sweep further back after a long outage. `REPAIR_INTERVAL_HOURS=0` turns it off.
+1. **Catalogue refresh** (at start and every `CATALOG_REFRESH_HOURS`, default 24). `symbols_get` over the allowed groups, compared with `symbol_state`: a new symbol becomes `active` with backfill `pending` (or `done` if it already has candles, which is the case for every symbol on the first run after deploy); a symbol the broker no longer lists becomes `delisted` (kept with its data, never deleted) and comes back to `active` if it reappears. An answer smaller than `CATALOG_MIN_RATIO` of the active set is taken as a terminal glitch and delists nothing. Stock/ETF groups are opt-in: `SYMBOL_EXTRA_PATH_PREFIXES` plus `SYMBOL_EXTRA_ALLOWLIST`, capped by `SYMBOL_EXTRA_MAX` (0 = off).
+2. **Regular pass**, last candle to now, for symbols whose backfill is done. When it is behind by more than two hours it first makes the terminal pull the server's history for the gap on H1 (a few hundred bars instead of tens of thousands, asked until two answers agree), then reads M1 and re-asks while any hour present on H1 is missing on M1 (`candles.symbol.incomplete` if it stays short). A symbol the broker has not quoted since our last candle is skipped without waiting (`candles.symbol.idle`, once a day).
+3. **Backfill of new symbols** within `BACKFILL_BUDGET_SECONDS` (default 240) after each pass, so the regular pass never waits for it. A D1 request over the whole range starts the download and finds the symbol's first bar (no walking empty years); then 30-day M1 chunks with an H1 completeness check and `BACKFILL_PAUSE_SECONDS` between chunks. Progress is the ordinary watermark; when it reaches now the symbol joins the regular pass.
+4. **Repair** every `REPAIR_INTERVAL_HOURS` (first run `REPAIR_WARMUP_MINUTES` after start, so the terminal has synced). Re-reads the trailing `REPAIR_LOOKBACK_DAYS` and further back to each symbol's verified cursor (`repair_state`), inserting only missing minutes. The cursor moves forward only over windows the terminal answered completely and that are older than `REPAIR_MIN_AGE_HOURS`, so after an outage of any length the hole is swept automatically; one run covers at most `REPAIR_MAX_DAYS`. `REPAIR_SINCE` is only needed once, for holes from before this was deployed.
 
-A symbol whose broker feed stopped (disabled, delisted, no quotes) writes nothing; it is logged once a day as `candles.symbol.idle` with the terminal's `trade_mode` and last quote time, so a dead feed is not mistaken for a stuck sync.
+Why the pass alone is not enough: `copy_rates_range` answers from the terminal's local history without waiting for the server. Right after a reconnect it can return the edges of a gap without its middle, with no error; the watermark then moves past the hole and a forward-only pass never comes back to it.
+
+---
 
 ## API
 
@@ -213,9 +217,12 @@ Every setting reads `MT5_CANDLES_<NAME>` first and the bare `<NAME>` second. `.e
 | `BACKFILL_INTERVAL_MINUTES` | 15. Also the freshness lag the API enforces — keep `FRESHNESS_LAG_MINUTES` equal to it. |
 | `BACKFILL_CHUNK_DAYS` | 30. How much history one `copy_rates_range` call asks for. |
 | `SYMBOL_INCLUDE_PATH_PREFIXES` | Empty means every symbol. **Set this.** A broker with thousands of stock CFDs will otherwise make the first sync enormous and slow the tick loop to a crawl; `Forex,Commodities,Indices,Crypto` is a sane default. |
+| `SYMBOL_EXTRA_PATH_PREFIXES`, `SYMBOL_EXTRA_ALLOWLIST`, `SYMBOL_EXTRA_MAX` | Stocks/ETFs on top of the base groups. `SYMBOL_EXTRA_MAX=0` (default) keeps them out; with it set, only allowlisted tickers (or the first N alphabetically) are taken. |
+| `CATALOG_REFRESH_HOURS` | 24. How often the broker list is reconciled with `symbol_state`. |
+| `BACKFILL_BUDGET_SECONDS` | 240. Time per pass given to the history of new symbols. Unlimited while no symbol has finished (fresh install). |
 | `SYMBOL_SUFFIXES` | Overrides the glued-suffix list. |
 | `TICK_POLL_MS` | 300. One pass over every watched symbol per tick; raise it if the symbol count is large. |
 | `PRUNE_CACHE` | `false`. The terminal's `Bases\` directory grows without bound while pulling years of minute history, but pruning forces a re-download on the next pass — leave it off during the initial backfill and turn it on once the service is in steady state. |
 | `MAX_ROWS` | 50000. The candle-count ceiling for one request. |
 
-The first pass over a full broker catalogue from 2020 runs for hours. It is resumable per symbol, so stopping and restarting costs only the symbol that was in flight.
+The first backfill of a full broker catalogue from 2020 runs for hours. It is resumable per symbol, so stopping and restarting costs only the chunk that was in flight.

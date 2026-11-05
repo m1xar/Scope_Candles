@@ -20,6 +20,9 @@ class Symbol(BaseModel):
     digits: int
     path: str
     last_candle_at: datetime | None = None
+    status: str = "active"
+    backfill: str = "done"
+    delisted_at: datetime | None = None
 
 
 class SymbolList(BaseModel):
@@ -32,15 +35,25 @@ async def list_symbols(
     search: str | None = Query(default=None),
     client: Any = Depends(get_clickhouse),
 ) -> SymbolList:
-    def read() -> tuple[list[dict[str, Any]], dict[str, datetime]]:
+    def read() -> tuple[list[dict[str, Any]], dict[str, datetime], dict[str, Any]]:
         with client.borrow() as connection:
-            return clickhouse.known_symbols(connection), clickhouse.watermarks(connection)
+            return (
+                clickhouse.known_symbols(connection),
+                clickhouse.watermarks(connection),
+                clickhouse.symbol_states(connection),
+            )
 
-    rows, marks = await asyncio.to_thread(read)
+    rows, marks, states = await asyncio.to_thread(read)
     needle = search.upper() if search else None
     symbols = [
-        Symbol(**row, last_candle_at=marks.get(row["symbol"]))
+        Symbol(**row, last_candle_at=marks.get(row["symbol"]), **_state_fields(states.get(row["symbol"])))
         for row in rows
         if needle is None or needle in row["symbol"] or needle in row["description"].upper()
     ]
     return SymbolList(count=len(symbols), symbols=symbols)
+
+
+def _state_fields(state: Any) -> dict[str, Any]:
+    if state is None:
+        return {}
+    return {"status": state.status, "backfill": state.backfill, "delisted_at": state.delisted_at}

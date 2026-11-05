@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 from symbols.normalize import SymbolInfo, normalize
 from utils.logging import log_event
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 TIMEFRAME_M1 = 1
 TIMEFRAME_H1 = 16385
+TIMEFRAME_D1 = 16408
 
 _EMPTY_RETRY_SLEEP_SECONDS = 2.0
 
@@ -102,6 +103,73 @@ def copy_rates(
         )
     candles.sort(key=lambda item: item[0])
     return candles
+
+
+class HistorySync(NamedTuple):
+    times: list[datetime]
+    stable: bool
+
+
+def sync_history(
+    terminal: MT5Terminal,
+    raw_symbol: str,
+    start: datetime,
+    end: datetime,
+    clock: ServerClock,
+    *,
+    timeframe: int = TIMEFRAME_H1,
+    attempts: int = 4,
+    wait_seconds: float = 2.0,
+) -> HistorySync:
+    """Make the terminal pull the server's history for [start, end) before M1 is read.
+
+    The terminal keeps only M1 locally and builds every timeframe from it, so asking for the
+    same range on a coarse timeframe (a few hundred bars instead of tens of thousands) starts
+    the download just as an M1 request would. It is asked again until two answers agree,
+    which is the cheapest sign the download has landed. Returns the bar opens in UTC: a
+    reference for what M1 should cover; ``stable`` is False when the answers never agreed
+    (download still running). No bars with ``stable`` means the server has nothing there.
+    """
+    server_start = clock.to_server(start) or start.replace(tzinfo=None)
+    server_end = clock.to_server(end) or end.replace(tzinfo=None)
+    previous = -1
+    stable = False
+    times: list[datetime] = []
+    for attempt in range(max(attempts, 1)):
+        rows = terminal.mt5.copy_rates_range(
+            raw_symbol, timeframe,
+            server_start.replace(tzinfo=timezone.utc), server_end.replace(tzinfo=timezone.utc),
+        )
+        if rows is None:
+            code, description = terminal.mt5.last_error()
+            if code is not None and code <= IPC_ERROR_CEILING:
+                raise terminal.failure(f"copy_rates_range failed for {raw_symbol}: {description}", code)
+        count = 0 if rows is None else len(rows)
+        if rows is not None and count:
+            times = []
+            for row in rows:
+                label = datetime.fromtimestamp(int(row["time"]), timezone.utc).replace(tzinfo=None)
+                moment = clock.to_utc(label) or label.replace(tzinfo=timezone.utc)
+                times.append(moment)
+        if count == previous:
+            stable = True
+            break
+        previous = count
+        if attempt + 1 < attempts:
+            time.sleep(wait_seconds)
+    return HistorySync(sorted(times), stable)
+
+
+def last_quote_at(terminal: MT5Terminal, raw_symbol: str, clock: ServerClock) -> datetime | None:
+    """When the broker last quoted the symbol; a feed that stopped answers with an old time."""
+    try:
+        row = terminal.mt5.symbol_info(raw_symbol)
+    except Exception:
+        return None
+    if row is None or not getattr(row, "time", 0):
+        return None
+    label = datetime.fromtimestamp(int(row.time), timezone.utc).replace(tzinfo=None)
+    return clock.to_utc(label) or label.replace(tzinfo=timezone.utc)
 
 
 def read_tick(terminal: MT5Terminal, raw_symbol: str, clock: ServerClock) -> dict[str, Any] | None:
